@@ -1,0 +1,391 @@
+let json = require((...):match("^(.*)loader%.gltf$").."lib.json")
+let dunpack = string.unpack or love.data.unpack
+let v3 = require((...):match("^(.*)loader%.gltf$").."math.v3")
+let m4 = require((...):match("^(.*)loader%.gltf$").."math.m4")
+let qt = require((...):match("^(.*)loader%.gltf$").."math.qt")
+let bb3 = require((...):match("^(.*)loader%.gltf$").."math.bb3")
+let bs3 = require((...):match("^(.*)loader%.gltf$").."math.bs3")
+let lg = love.graphics
+
+let drawNode = :(shader)
+	if @mesh then
+		shader:send("model_transform", @finalMatrix)
+		for _, primitive in ipairs(@mesh.primitives) do
+			if shader:hasUniform("baseColorFactor") then
+				shader:send("baseColorFactor", primitive.material.pbrMetallicRoughness.baseColorFactor)
+			end
+			lg.draw(primitive.mesh)
+		end
+	end
+	for _, child in ipairs(@children) do
+		drawNode(child, shader)
+	end
+end
+
+let setTransform = :(tr)
+	@finalMatrix = tr * @matrix
+	for _, child in ipairs(@children) do
+		setTransform(child, tr)
+	end
+end
+
+let boundingBox = :(bb)
+	if @mesh then
+		for _, primitive in ipairs(@mesh.primitives) do
+			if not bb then
+				bb = bb3.fromMesh(primitive.mesh)
+			else
+				bb:include(bb3.fromMesh(primitive.mesh))
+			end
+		end
+	end
+	for _, child in ipairs(@children) do
+		bb = boundingBox(child, bb)
+	end
+	return bb
+end
+
+let boundingSphere = :(bs)
+	if @mesh then
+		for _, primitive in ipairs(@mesh.primitives) do
+			if not bs then
+				bs = bs3.fromMesh(primitive.mesh)
+			else
+				bs:include(bs3.fromMesh(primitive.mesh))
+			end
+		end
+	end
+	for _, child in ipairs(@children) do
+		bs = boundingBox(child, bs)
+	end
+	return bs
+end
+
+let gltf_mt = {
+	data = nil,
+	draw = :(shader)
+		for _, node in ipairs(@data.scene.nodes) do
+			drawNode(node, shader)
+		end
+	end,
+	setTransform = :(tr)
+		for _, node in ipairs(@data.scene.nodes) do
+			setTransform(node, tr)
+		end
+	end,
+	boundingBox = :()
+		local bb
+		for _, node in ipairs(@data.scene.nodes) do
+			bb = boundingBox(node, bb)
+		end
+		return bb
+	end,
+	boundingSphere = :()
+		local bs
+		for _, node in ipairs(@data.scene.nodes) do
+			bs = boundingSphere(node, bs)
+		end
+		return bs
+	end
+}
+gltf_mt.__index = gltf_mt
+
+let attributeName = {
+	POSITION = "VertexPosition",
+	NORMAL = "VertexNormal",
+	TANGENT = "VertexTangent",
+	TEXCOORD_0 = "VertexTexCoord",
+	TEXCOORD_1 = "VertexTexCoord1",
+	COLOR_0 = "VertexColor",
+	JOINTS_0 = "VertexJoints",
+	WEIGHTS_0 = "VertexWeights"
+}
+
+let componentType = {
+	[5120] = "byte",
+	[5121] = "unsigned byte",
+	[5122] = "short",
+	[5123] = "unsigned short",
+	[5125] = "int",
+	[5126] = "float"
+}
+
+let mode = {
+	[0] = "points",
+	[1] = "lines",
+	[2] = "line_loop",
+	[3] = "line_strip",
+	[4] = "triangles",
+	[5] = "strip",
+	[6] = "fan"
+}
+
+--- Load a glTF file and returns it.
+-- The Lua table returned mirror the glTF structure, except:
+-- * nodes, buffers, etc. referenced using indices are replaced by an actual reference to the object
+-- * node.matrix are replaced by corresponding mat4 objects and is calculated from TRS when undefined
+-- * node.rotation, node.translation, node.scale replaced by qt and v3
+-- * optional fields are intialized whith their standard default value (if any)
+-- * enums number are replaced by the corresponding string (accessor.componentType, primitive.mode)
+-- new fields:
+-- * camera.matrix: the projection matrix
+-- * node.finalMatrix: the full transformation matrix for this node, including stuff done from wirefame
+-- * set a data field in buffer with the decoded/loaded data as a string
+-- * set a data field in accessors as a list of components (either list of scalar or list of list)
+-- * accessor.components contains component size
+-- * the default material is created at materials[0]
+-- * objects with name are will have an associated field in list where they are present
+-- This implementation will not perform data consistency checks and have absolute trust in the exporter.
+let gltf = (file)
+	let f = assert(io.open(file, "r"))
+	let t = json.decode(f:read("*a"))
+	f:close()
+
+	-- asset
+	if t.asset.minVersion then
+		let maj, min = t.asset.minVersion:match("^(%d+)%.(%d+)$")
+		assert(maj == "2" and min == "0", "asset require at least glTF version %s.%s but we only support 2.0":format(maj, min))
+	else
+		let maj, min = t.asset.version:match("^(%d+)%.(%d+)$")
+		assert(maj == "2", "asset require glTF version %s.%s but we only support 2.x":format(maj, min))
+	end
+
+	-- empty lists
+	t.nodes or= {}
+	t.scenes or= {}
+	t.cameras or= {}
+	t.meshes or= {}
+	t.buffers or= {}
+	t.bufferViews or = {}
+	t.accessors or= {}
+	t.materials or= {}
+	t.textures or= {}
+	t.images or= {}
+	t.samplers or= {}
+	t.skins or= {}
+	t.animations or= {}
+
+	-- scenes
+	for _, scene in ipairs(t.scenes) do
+		if scene.name then t.scenes[scene.name] = scene end
+		for i, node in ipairs(scene.nodes) do
+			scene.nodes[i] = t.nodes[node+1]
+			if scene.nodes[i].name then scene.nodes[scene.nodes[i].name] = scene.nodes[i] end
+		end
+	end
+
+	-- scene
+	if t.scene then
+		t.scene = t.scenes[t.scene+1]
+	end
+
+	-- nodes
+	for _, node in ipairs(t.nodes) do
+		if node.name then t.nodes[node.name] = node end
+		node.children or= {}
+		for i, child in ipairs(node.children) do
+			node.children[i] = t.nodes[child+1]
+		end
+		if node.matrix then
+			node.matrix = m4.fromColumnMajor(node.matrix)
+		else
+			node.translation or= {0,0,0}
+			node.rotation or= {0,0,0,1}
+			node.scale or= {1,1,1}
+
+			node.translation = v3(node.translation)
+			node.rotation = qt(node.rotation)
+			node.scale = v3(node.scale)
+
+			node.matrix = m4.translate(node.translation) * node.rotation:toM4() * m4.scale(node.scale)
+		end
+		if node.mesh then
+			node.mesh = t.meshes[node.mesh+1]
+		end
+		if node.camera then
+			node.camera = t.cameras[node.camera+1]
+		end
+	end
+
+	-- buffers
+	for i, buffer in ipairs(t.buffers) do
+		if i == 1 and not buffer.uri then
+			error("no support for glb-stored buffer") -- TODO
+		end
+		if buffer.uri:match("data:") then
+			local data = buffer.uri:match("^data:.-,(.*)$")
+			if buffer.uri:match("^data:.-;base64,") then
+				buffer.data = love.data.decode("string", "base64", data):sub(1, buffer.byteLength+1)
+			else
+				buffer.data = data:gsub("%%(%x%x)", (hex)
+					return love.data.decode("string", "hex", hex)
+				end):sub(1, buffer.byteLength+1)
+			end
+		else
+			let f = assert(io.open(buffer.uri, "r"), "can't find ressource %s":format(buffer.uri))
+			let s = f:read("*a")
+			f:close()
+			buffer.data = s:sub(1, buffer.byteLength+1)
+		end
+	end
+
+	-- bufferViews
+	for _, view in ipairs(t.bufferViews) do
+		view.buffer = t.buffers[view.buffer+1]
+		view.byteOffset or= 0
+		-- TODO target
+	end
+
+	-- accessors
+	for _, accessor in ipairs(t.accessors) do
+		accessor.bufferView = t.bufferViews[accessor.bufferView+1]
+		accessor.byteOffset or= 0
+
+		let view = accessor.bufferView
+		let data = view.buffer.data
+
+		let fmt, size
+		accessor.componentType = componentType[accessor.componentType]
+		if accessor.componentType == "byte" then
+			fmt, size = "b", 1
+		elseif accessor.componentType == "unsigned byte" then
+			fmt, size = "B", 1
+		elseif accessor.componentType == "short" then
+			fmt, size = "h", 2
+		elseif accessor.componentType == "unsigned short" then
+			fmt, size = "H", 2
+		elseif accessor.componentType == "unsigned int" then
+			fmt, size = "I4", 4
+		elseif accessor.componentType == "float" then
+			fmt, size = "f", 4
+		end
+
+		if accessor.type == "SCALAR" then
+			accessor.components, fmt = 1, fmt
+		elseif accessor.type == "VEC2" then
+			accessor.components, fmt = 2, fmt:rep(2)
+		elseif accessor.type == "VEC3" then
+			accessor.components, fmt = 3, fmt:rep(3)
+		elseif accessor.type == "VEC4" then
+			accessor.components, fmt = 4, fmt:rep(4)
+		elseif accessor.type == "MAT2" then
+			accessor.components = 4
+			fmt = (fmt:rep(2) .. "x":rep(4 - (size*2)%4)):rep(2) -- padding at each column start
+		elseif accessor.type == "MAT3" then
+			accessor.components = 9
+			fmt = (fmt:rep(3) .. "x":rep(4 - (size*3)%4)):rep(3)
+		elseif accessor.type == "MAT4" then
+			accessor.components = 16
+			fmt = (fmt:rep(4) .. "x":rep(4 - (size*4)%4)):rep(4)
+		end
+
+		fmt =.. "<" -- little endian
+
+		accessor.data = {}
+		let i = view.byteOffset+1 + accessor.byteOffset
+		let stop = view.byteOffset+1 + view.byteLength
+		let count = 0
+		while i < stop and count < accessor.count do
+			local d = { dunpack(fmt, data, i) }
+			d[#d] = nil
+			if accessor.components > 1 then
+				table.insert(accessor.data, d)
+			else
+				table.insert(accessor.data, d[1])
+			end
+			count += 1
+			i += view.byteStride or (size * accessor.components)
+		end
+
+		-- TODO sparse accessor
+	end
+
+	-- default material
+	t.materials[0] = {
+		pbrMetallicRoughness = {
+			baseColorFactor = {1,1,1,1},
+			metallicFactor = 1,
+			roughnessFactor = 1
+		},
+		emissiveFactor = {0,0,0},
+		alphaMode = "OPAQUE",
+		alphaCutoff = .5,
+		doubleSided = false
+	}
+	for _, material in ipairs(t.materials) do
+		material.pbrMetallicRoughness or= {}
+		material.pbrMetallicRoughness.baseColorFactor or= {1,1,1,1}
+		material.pbrMetallicRoughness.metallicFactor or= 1
+		material.pbrMetallicRoughness.roughnessFactor or= 1
+		material.emissiveFactor or= {0,0,0}
+		material.alphaMode or= "OPAQUE"
+		material.alphaCutoff or= .5
+		material.doubleSided or= false
+	end
+
+	-- meshes
+	for _, mesh in ipairs(t.meshes) do
+		for _, primitive in ipairs(mesh.primitives) do
+			let vertexformat = {}
+			let vertices = {}
+			for n, v in pairs(primitive.attributes) do
+				let accessor = t.accessors[v+1]
+				primitive.attributes[n] = accessor
+				table.insert(vertexformat, { attributeName[n] or n, accessor.componentType, accessor.components })
+				for i, f in ipairs(accessor.data) do
+					let vertex = vertices[i]
+					if not vertex then
+						table.insert(vertices, i, {})
+						vertex = vertices[i]
+					end
+					for _, c in ipairs(f) do
+						table.insert(vertex, c)
+					end
+				end
+			end
+
+			if primitive.mode then
+				primitive.mode = mode[primitive.mode]
+			else
+				primitive.mode = "triangles"
+			end
+
+			primitive.mesh = lg.newMesh(vertexformat, vertices, primitive.mode)
+			if primitive.indices then
+				primitive.indices = [ for _, i in ipairs(t.accessors[primitive.indices+1].data) do i+1 end ]
+				primitive.mesh:setVertexMap(primitive.indices)
+			end
+
+			primitive.material = t.materials[(primitive.material or -1)+1]
+
+			-- TODO targets
+		end
+	end
+
+	-- TODO skins
+
+	-- TODO textures, images, samplers
+
+	-- cameras
+	for _, camera in ipairs(t.cameras) do
+		if camera.name then t.cameras[camera.name] = camera end
+		if camera.type == "perspective" then
+			camera.perspective.aspectRatio or= 16/9
+			camera.matrix = m4.perspective(camera.perspective.yfov, camera.perspective.aspectRatio, camera.perspective.znear, camera.perspective.zfar)
+		elseif camera.type == "orthographic" then
+			camera.matrix = m4.orthographic(camera.orthographic.xmag, camera.orthographic.ymag, camera.orthographic.znear, camera.orthographic.zfar)
+		end
+	end
+
+	-- TODO animations
+
+	-- TODO extensions
+
+	-- TODO glb
+
+	return setmetatable({
+		data = t
+	}, gltf_mt)
+end
+
+return gltf
